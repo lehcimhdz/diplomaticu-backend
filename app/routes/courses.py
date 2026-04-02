@@ -75,28 +75,70 @@ def answer_question(question_id):
 
     pregunta = Pregunta.query.get_or_404(question_id)
     is_correct = pregunta.respuesta_correcta == answer
+    user_id = g.current_user.id
 
     existing = RespuestaUsuario.query.filter_by(
-        id_pregunta=question_id, id_usuario=g.current_user.id
+        id_pregunta=question_id, id_usuario=user_id
     ).first()
 
+    is_new = existing is None
     if existing:
+        was_correct = existing.resultado
         existing.respuesta_usuario = answer
         existing.resultado = is_correct
         existing.tiempo_respuesta = time_spent
-        db.session.commit()
-        return jsonify(existing.to_dict())
+        respuesta = existing
+    else:
+        was_correct = None
+        respuesta = RespuestaUsuario(
+            id_pregunta=question_id,
+            id_usuario=user_id,
+            respuesta_usuario=answer,
+            resultado=is_correct,
+            tiempo_respuesta=time_spent,
+        )
+        db.session.add(respuesta)
 
-    respuesta = RespuestaUsuario(
-        id_pregunta=question_id,
-        id_usuario=g.current_user.id,
-        respuesta_usuario=answer,
-        resultado=is_correct,
-        tiempo_respuesta=time_spent,
-    )
-    db.session.add(respuesta)
+    # Actualizar progreso del curso
+    progreso = ProgresoUsuario.query.filter_by(
+        usuario_id=user_id, curso_id=pregunta.id_curso
+    ).first()
+    if progreso:
+        if is_new:
+            progreso.preguntas_respondidas += 1
+            if is_correct:
+                progreso.preguntas_correctas += 1
+        else:
+            # Corregir si cambió el resultado
+            if not was_correct and is_correct:
+                progreso.preguntas_correctas += 1
+            elif was_correct and not is_correct:
+                progreso.preguntas_correctas -= 1
+
+        total = progreso.preguntas_respondidas
+        progreso.porcentaje_completado = (
+            (progreso.preguntas_correctas / total * 100) if total else 0
+        )
+        from datetime import datetime
+        progreso.fecha_ultima_actividad = datetime.utcnow()
+
     db.session.commit()
-    return jsonify(respuesta.to_dict()), 201
+
+    return jsonify({
+        'respuesta': respuesta.to_dict(),
+        'es_correcta': is_correct,
+        'respuesta_correcta': pregunta.respuesta_correcta,
+        'explicacion': pregunta.explicacion,
+        'progreso': {
+            'preguntas_respondidas': progreso.preguntas_respondidas if progreso else 0,
+            'preguntas_correctas': progreso.preguntas_correctas if progreso else 0,
+            'porcentaje_completado': float(progreso.porcentaje_completado) if progreso else 0,
+            'porcentaje_aciertos': (
+                progreso.preguntas_correctas / progreso.preguntas_respondidas * 100
+                if progreso and progreso.preguntas_respondidas else 0
+            ),
+        },
+    }), 200
 
 
 @courses_bp.post('/questions/bulk-answer')
