@@ -1,4 +1,5 @@
 from flask import Blueprint, request, jsonify, g
+import bcrypt
 from app import db
 from app.middleware.auth import require_auth
 from app.models.user import PerfilUsuario, LogroUsuario
@@ -64,3 +65,25 @@ def get_progress():
 def get_gamification():
     nivel = g.current_user.nivel
     return jsonify(nivel.to_dict() if nivel else {})
+
+
+@users_bp.post('/change-password')
+@require_auth
+def change_password():
+    data = request.get_json()
+    password_actual = data.get('password_actual')
+    password_nueva = data.get('password_nueva')
+
+    if not password_actual or not password_nueva:
+        return jsonify({'error': 'Faltan campos requeridos'}), 400
+
+    user = g.current_user
+    if not bcrypt.checkpw(password_actual.encode(), user.password_hash.encode()):
+        return jsonify({'error': 'Contraseña actual incorrecta'}), 400
+
+    if len(password_nueva) < 8:
+        return jsonify({'error': 'La nueva contraseña debe tener al menos 8 caracteres'}), 400
+
+    user.password_hash = bcrypt.hashpw(password_nueva.encode(), bcrypt.gensalt()).decode()
+    db.session.commit()
+    return jsonify({'message': 'Contraseña actualizada correctamente'})

@@ -1,10 +1,56 @@
+from datetime import datetime, date
 from flask import Blueprint, request, jsonify, g
 from sqlalchemy import func
 from app import db
 from app.middleware.auth import require_auth
 from app.models.course import Curso, Pregunta, Inscripcion, ProgresoUsuario, RespuestaUsuario
+from app.models.user import NivelUsuario
 
 courses_bp = Blueprint('courses', __name__)
+
+PUNTOS_POR_ACIERTO = 10
+
+
+def _update_nivel(user_id, puntos_ganados):
+    """Suma puntos y actualiza racha de días al usuario."""
+    nivel = NivelUsuario.query.filter_by(usuario_id=user_id).first()
+    if not nivel:
+        return
+
+    nivel.puntos_totales += puntos_ganados
+
+    hoy = date.today()
+    ultima = nivel.fecha_ultima_actividad
+    if ultima != hoy:
+        nivel.racha_dias = nivel.racha_dias + 1 if ultima and (hoy - ultima).days == 1 else 1
+        nivel.fecha_ultima_actividad = hoy
+
+    # Subir de nivel cada 100 puntos
+    nivel.nivel_actual = max(1, nivel.puntos_totales // 100 + 1)
+
+
+def _update_progreso(user_id, curso_id, is_new, is_correct, was_correct):
+    """Actualiza ProgresoUsuario y devuelve el objeto."""
+    progreso = ProgresoUsuario.query.filter_by(
+        usuario_id=user_id, curso_id=curso_id
+    ).first()
+    if not progreso:
+        return None
+
+    if is_new:
+        progreso.preguntas_respondidas += 1
+        if is_correct:
+            progreso.preguntas_correctas += 1
+    else:
+        if not was_correct and is_correct:
+            progreso.preguntas_correctas += 1
+        elif was_correct and not is_correct:
+            progreso.preguntas_correctas -= 1
+
+    total = progreso.preguntas_respondidas
+    progreso.porcentaje_completado = (progreso.preguntas_correctas / total * 100) if total else 0
+    progreso.fecha_ultima_actividad = datetime.utcnow()
+    return progreso
 
 
 @courses_bp.get('/')
@@ -99,28 +145,12 @@ def answer_question(question_id):
         )
         db.session.add(respuesta)
 
-    # Actualizar progreso del curso
-    progreso = ProgresoUsuario.query.filter_by(
-        usuario_id=user_id, curso_id=pregunta.id_curso
-    ).first()
-    if progreso:
-        if is_new:
-            progreso.preguntas_respondidas += 1
-            if is_correct:
-                progreso.preguntas_correctas += 1
-        else:
-            # Corregir si cambió el resultado
-            if not was_correct and is_correct:
-                progreso.preguntas_correctas += 1
-            elif was_correct and not is_correct:
-                progreso.preguntas_correctas -= 1
+    progreso = _update_progreso(user_id, pregunta.id_curso, is_new, is_correct, was_correct)
 
-        total = progreso.preguntas_respondidas
-        progreso.porcentaje_completado = (
-            (progreso.preguntas_correctas / total * 100) if total else 0
-        )
-        from datetime import datetime
-        progreso.fecha_ultima_actividad = datetime.utcnow()
+    if is_new and is_correct:
+        _update_nivel(user_id, PUNTOS_POR_ACIERTO)
+    elif not is_new and not was_correct and is_correct:
+        _update_nivel(user_id, PUNTOS_POR_ACIERTO)
 
     db.session.commit()
 
@@ -146,7 +176,13 @@ def answer_question(question_id):
 def bulk_answer():
     data = request.get_json()
     answers = data.get('answers', [])
+    user_id = g.current_user.id
     results = []
+    puntos_ganados = 0
+
+    # Agrupar cambios de progreso por curso
+    progreso_delta = {}  # curso_id -> {respondidas, correctas}
+
     for item in answers:
         question_id = item.get('id_pregunta')
         answer = item.get('respuesta_usuario')
@@ -158,24 +194,55 @@ def bulk_answer():
 
         is_correct = pregunta.respuesta_correcta == answer
         existing = RespuestaUsuario.query.filter_by(
-            id_pregunta=question_id, id_usuario=g.current_user.id
+            id_pregunta=question_id, id_usuario=user_id
         ).first()
 
+        curso_id = pregunta.id_curso
+        if curso_id not in progreso_delta:
+            progreso_delta[curso_id] = {'respondidas': 0, 'correctas': 0}
+
         if existing:
+            was_correct = existing.resultado
             existing.respuesta_usuario = answer
             existing.resultado = is_correct
             existing.tiempo_respuesta = time_spent
             results.append(existing)
+            if not was_correct and is_correct:
+                progreso_delta[curso_id]['correctas'] += 1
+                puntos_ganados += PUNTOS_POR_ACIERTO
+            elif was_correct and not is_correct:
+                progreso_delta[curso_id]['correctas'] -= 1
         else:
             respuesta = RespuestaUsuario(
                 id_pregunta=question_id,
-                id_usuario=g.current_user.id,
+                id_usuario=user_id,
                 respuesta_usuario=answer,
                 resultado=is_correct,
                 tiempo_respuesta=time_spent,
             )
             db.session.add(respuesta)
             results.append(respuesta)
+            progreso_delta[curso_id]['respondidas'] += 1
+            if is_correct:
+                progreso_delta[curso_id]['correctas'] += 1
+                puntos_ganados += PUNTOS_POR_ACIERTO
+
+    # Aplicar deltas de progreso
+    for curso_id, delta in progreso_delta.items():
+        progreso = ProgresoUsuario.query.filter_by(
+            usuario_id=user_id, curso_id=curso_id
+        ).first()
+        if progreso:
+            progreso.preguntas_respondidas += delta['respondidas']
+            progreso.preguntas_correctas += delta['correctas']
+            total = progreso.preguntas_respondidas
+            progreso.porcentaje_completado = (
+                progreso.preguntas_correctas / total * 100 if total else 0
+            )
+            progreso.fecha_ultima_actividad = datetime.utcnow()
+
+    if puntos_ganados > 0:
+        _update_nivel(user_id, puntos_ganados)
 
     db.session.commit()
     return jsonify([r.to_dict() for r in results])
